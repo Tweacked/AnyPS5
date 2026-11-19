@@ -49,6 +49,10 @@ constexpr std::uint32_t LcDyldInfoOnly = 0x80000022;
 constexpr std::uint32_t LcMain = 0x80000028;
 constexpr std::uint32_t LcBuildVersion = 0x32;
 constexpr std::uint32_t LcCodeSignature = 0x1d;
+constexpr std::size_t HeaderSize = 32;
+constexpr std::size_t SegmentCommandSize = 72;
+constexpr std::size_t SectionCommandSize = 80;
+constexpr std::size_t ProgramHeaderSize = 56;
 
 constexpr std::uint32_t VmProtRead = 1;
 constexpr std::uint32_t VmProtWrite = 2;
@@ -82,6 +86,9 @@ constexpr std::size_t MetaTlsKey = MetaTlsDescriptor + 0x28;
 constexpr std::size_t MetaCxaAtexitSlot = 0x50;
 constexpr std::size_t MetaHeaderCount = 0x58;
 constexpr std::size_t MetaHeaders = 0x60;
+constexpr char MetaSegmentName[] = "__APS5DATA";
+constexpr char MetaSectionName[] = "__meta";
+constexpr char GuestSegmentPrefix[] = "__ELF";
 
 constexpr std::uint8_t EntryStub[] = {
     0x31, 0xc9, 0x48, 0x83, 0x3c, 0xca, 0x00, 0x74, 0x05, 0x48, 0xff, 0xc1, 0xeb, 0xf4, 0x48, 0x8d,
@@ -648,13 +655,13 @@ std::vector<std::uint8_t> WriteMacOsImage(MacOsImageInput& input) {
         if (section.Characteristics & Windows::SectionRead) protection |= VmProtRead;
         if (section.Characteristics & Windows::SectionWrite) protection |= VmProtWrite;
         if (section.Characteristics & Windows::SectionExecute) protection |= VmProtExecute;
-        auto name = section.Name == ".amdstub" ? std::string("__AMDSTUB") : "__ELF" + std::to_string(segments.size() - guestSegments);
+        auto name = section.Name == ".amdstub" ? std::string("__AMDSTUB") : GuestSegmentPrefix + std::to_string(segments.size() - guestSegments);
         guestEnd = std::max<std::uint64_t>(guestEnd, section.Rva + section.MemorySize());
         segments.push_back({std::move(name), section.Rva, section.MemorySize(), protection, std::move(section.Data), {}});
     }
 
     const auto metaRva = static_cast<std::uint32_t>(AlignUp(guestEnd, PageSize));
-    const auto metaSize = MetaHeaders + headers.size() * 56;
+    const auto metaSize = MetaHeaders + headers.size() * ProgramHeaderSize;
     std::vector<std::uint8_t> meta(metaSize, 0);
     Io::WriteU64(meta, 0, MetaVersion);
     const auto firstLoad = std::find_if(headers.begin(), headers.end(), [](const auto& header) { return header.Type == 1 && header.MemorySize != 0; });
@@ -664,7 +671,7 @@ std::vector<std::uint8_t> WriteMacOsImage(MacOsImageInput& input) {
     Io::WriteU64(meta, MetaHeaderCount, headers.size());
     for (std::size_t index = 0; index < headers.size(); ++index) {
         const auto& header = headers[index];
-        const auto at = MetaHeaders + index * 56;
+        const auto at = MetaHeaders + index * ProgramHeaderSize;
         Io::WriteU32(meta, at, header.Type);
         Io::WriteU32(meta, at + 4, header.Flags);
         Io::WriteU64(meta, at + 8, header.Offset);
@@ -831,7 +838,7 @@ std::vector<std::uint8_t> WriteMacOsImage(MacOsImageInput& input) {
     }
 
     const bool hasInit = hasTls || !input.TlsImports.empty() || input.InitRva != 0 || !input.InitArrayRvas.empty() || hasFini;
-    std::vector<Section> dataSections{{"__meta", 0, metaSize, 0, 3}};
+    std::vector<Section> dataSections{{MetaSectionName, 0, metaSize, 0, 3}};
     if (hasInit) {
         const auto initStub = code.GetRva();
         code.Emit({0x55, 0x48, 0x89, 0xe5});
@@ -911,7 +918,7 @@ std::vector<std::uint8_t> WriteMacOsImage(MacOsImageInput& input) {
         for (const auto byte : prologue.Bytes) code.Emit({byte});
     }
     const auto metaBytes = meta.size();
-    segments.push_back({"__APS5DATA", metaRva, metaBytes, VmProtRead | VmProtWrite, std::move(meta), std::move(dataSections)});
+    segments.push_back({MetaSegmentName, metaRva, metaBytes, VmProtRead | VmProtWrite, std::move(meta), std::move(dataSections)});
     auto stubs = code.TakeBytes();
     if (!stubs.empty()) segments.push_back({"__APS5TEXT", codeRva, stubs.size(), VmProtRead | VmProtExecute, std::move(stubs), {}});
 
@@ -965,7 +972,7 @@ std::vector<std::uint8_t> WriteMacOsImage(MacOsImageInput& input) {
     for (const auto& segment : segments) {
         segmentCommandOffsets.push_back(commands.size());
         Io::AppendU32(commands, LcSegment64);
-        Io::AppendU32(commands, static_cast<std::uint32_t>(72 + 80 * segment.Sections.size()));
+        Io::AppendU32(commands, static_cast<std::uint32_t>(SegmentCommandSize + SectionCommandSize * segment.Sections.size()));
         AppendName16(commands, segment.Name);
         for (int field = 0; field < 4; ++field) Io::AppendU64(commands, 0);
         Io::AppendU32(commands, segment.Protection);
@@ -988,7 +995,7 @@ std::vector<std::uint8_t> WriteMacOsImage(MacOsImageInput& input) {
     }
     const auto linkeditCommand = commands.size();
     Io::AppendU32(commands, LcSegment64);
-    Io::AppendU32(commands, 72);
+    Io::AppendU32(commands, SegmentCommandSize);
     AppendName16(commands, "__LINKEDIT");
     for (int field = 0; field < 4; ++field) Io::AppendU64(commands, 0);
     Io::AppendU32(commands, VmProtRead);
@@ -1066,7 +1073,6 @@ std::vector<std::uint8_t> WriteMacOsImage(MacOsImageInput& input) {
     ++commandCount;
 
     std::vector<std::uint8_t> file;
-    constexpr std::size_t HeaderSize = 32;
     constexpr std::size_t LoadCommandReserve = 0x400;
     const auto stubOffset = AlignUp(HeaderSize + commands.size() + LoadCommandReserve, 16);
     const auto traceJump = input.Executable && input.TraceImports;
@@ -1139,7 +1145,7 @@ std::vector<std::uint8_t> WriteMacOsImage(MacOsImageInput& input) {
         writeSegment(segmentCommandOffsets[index], imageBase + segment.Rva, AlignUp(segment.MemorySize, PageSize), segment.FileOffset, segment.Data.size());
         for (std::size_t sectionIndex = 0; sectionIndex < segment.Sections.size(); ++sectionIndex) {
             const auto& section = segment.Sections[sectionIndex];
-            const auto at = segmentCommandOffsets[index] + 72 + sectionIndex * 80;
+            const auto at = segmentCommandOffsets[index] + SegmentCommandSize + sectionIndex * SectionCommandSize;
             Io::WriteU64(commands, at + 32, imageBase + segment.Rva + section.Offset);
             Io::WriteU32(commands, at + 48, static_cast<std::uint32_t>(segment.FileOffset + section.Offset));
         }
@@ -1176,6 +1182,92 @@ std::vector<std::uint8_t> WriteMacOsImage(MacOsImageInput& input) {
     AppendCodeSignature(file, input.Identifier, 0, LoadRva, input.Executable);
     if (file.size() != codeSignatureOffset + codeSignatureSize) throw Domain::RelinkerException("Mach-O code signature does not fill its __LINKEDIT space");
     return file;
+}
+
+std::optional<MacOsGuestLayout> ReadMacOsGuestLayout(const std::vector<std::uint8_t>& file) {
+    if (file.size() < 4 || Io::ReadU32(file, 0) != MhMagic64) return std::nullopt;
+    if (file.size() < HeaderSize || Io::ReadU32(file, 4) != CpuTypeX8664 || Io::ReadU32(file, 12) != MhExecute)
+        throw Domain::RelinkerException("Not an x86-64 Mach-O executable: verify the input instead");
+    const auto commandBytes = Io::ReadU32(file, 20);
+    if (commandBytes > file.size() - HeaderSize) throw Domain::RelinkerException("Truncated Mach-O load commands");
+    const auto end = HeaderSize + commandBytes;
+    const auto commandCount = Io::ReadU32(file, 16);
+    const auto nameAt = [&](const std::size_t at) {
+        const std::string_view name(reinterpret_cast<const char*>(file.data() + at), 16);
+        return name.substr(0, name.find('\0'));
+    };
+    MacOsGuestLayout layout{};
+    std::optional<MacOsGuestFileRange> metadata;
+    auto at = HeaderSize;
+    for (std::uint32_t index = 0; index < commandCount; ++index) {
+        if (end - at < 8) throw Domain::RelinkerException("Truncated Mach-O load commands", at);
+        const auto size = Io::ReadU32(file, at + 4);
+        if (size < 8 || size % 8 != 0 || size > end - at)
+            throw Domain::RelinkerException("Invalid Mach-O load command size", at);
+        const auto command = at;
+        at += size;
+        if (Io::ReadU32(file, command) != LcSegment64) continue;
+        if (size < SegmentCommandSize) throw Domain::RelinkerException("Truncated Mach-O segment command", command);
+        const auto sectionCount = Io::ReadU32(file, command + 64);
+        if (size - SegmentCommandSize != std::uint64_t{sectionCount} * SectionCommandSize)
+            throw Domain::RelinkerException("Invalid Mach-O section table size", command);
+        const auto name = nameAt(command + 8);
+        const auto address = Io::ReadU64(file, command + 24);
+        const auto memorySize = Io::ReadU64(file, command + 32);
+        const auto offset = Io::ReadU64(file, command + 40);
+        const auto fileSize = Io::ReadU64(file, command + 48);
+        if (fileSize > memorySize || memorySize > std::numeric_limits<std::uint64_t>::max() - address ||
+            offset > file.size() || fileSize > file.size() - offset)
+            throw Domain::RelinkerException("Invalid Mach-O segment range", command);
+        if (name.starts_with(GuestSegmentPrefix) && fileSize != 0) {
+            if (offset < end) throw Domain::RelinkerException("Mach-O guest segment overlaps the load commands", command);
+            if (!layout.FileRanges.empty()) {
+                auto& previous = layout.FileRanges.back();
+                const auto addressEnd = previous.Address + previous.Size;
+                const auto offsetEnd = previous.Offset + previous.Size;
+                if (address < addressEnd || offset < offsetEnd)
+                    throw Domain::RelinkerException("Overlapping or unordered Mach-O guest segments", command);
+                if (address == addressEnd && offset == offsetEnd) {
+                    previous.Size += fileSize;
+                    continue;
+                }
+            }
+            layout.FileRanges.push_back({address, offset, fileSize});
+        }
+        if (name != MetaSegmentName) continue;
+        for (std::uint32_t section = 0; section < sectionCount; ++section) {
+            const auto entry = command + SegmentCommandSize + section * SectionCommandSize;
+            if (nameAt(entry) != MetaSectionName || nameAt(entry + 16) != MetaSegmentName) continue;
+            const auto metaAddress = Io::ReadU64(file, entry + 32);
+            const auto metaSize = Io::ReadU64(file, entry + 40);
+            const std::uint64_t metaOffset = Io::ReadU32(file, entry + 48);
+            if (metadata || metaOffset < end || metaOffset < offset || metaOffset - offset > fileSize ||
+                metaSize < MetaHeaders || metaSize > fileSize - (metaOffset - offset) || metaAddress != address + (metaOffset - offset))
+                throw Domain::RelinkerException("Invalid Mach-O guest metadata range", entry);
+            metadata = MacOsGuestFileRange{metaAddress, metaOffset, metaSize};
+        }
+    }
+    if (at != end) throw Domain::RelinkerException("Invalid Mach-O load commands size", at);
+    if (!metadata || Io::ReadU64(file, metadata->Offset) != MetaVersion)
+        throw Domain::RelinkerException("Missing or unsupported AnyPS5 Mach-O guest metadata: verify the input instead");
+
+    const auto headerCount = Io::ReadU64(file, metadata->Offset + MetaHeaderCount);
+    if (headerCount > std::numeric_limits<std::uint16_t>::max() || headerCount > (metadata->Size - MetaHeaders) / ProgramHeaderSize)
+        throw Domain::RelinkerException("Invalid Mach-O guest metadata program header count", metadata->Offset);
+    layout.LoadBias = Io::ReadU64(file, metadata->Offset + MetaLoadBias);
+    for (std::uint64_t index = 0; index < headerCount; ++index) {
+        const auto header = metadata->Offset + MetaHeaders + index * ProgramHeaderSize;
+        if (Io::ReadU32(file, header) != PT_LOAD) continue;
+        const auto address = Io::ReadU64(file, header + 16);
+        const auto size = Io::ReadU64(file, header + 32);
+        const auto memorySize = Io::ReadU64(file, header + 40);
+        if (size > memorySize || memorySize > std::numeric_limits<std::uint64_t>::max() - address)
+            throw Domain::RelinkerException("Invalid PT_LOAD range in Mach-O guest metadata", header);
+        if (size != 0) layout.GuestLoads.push_back({address, Io::ReadU64(file, header + 8), size});
+    }
+    if (layout.GuestLoads.empty() || layout.FileRanges.empty())
+        throw Domain::RelinkerException("Mach-O output has no file-backed guest load ranges");
+    return layout;
 }
 
 }

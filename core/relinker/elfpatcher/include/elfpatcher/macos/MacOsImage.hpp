@@ -6,6 +6,7 @@
 #include <domain/Types.hpp>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -74,9 +75,23 @@ struct MacOsImageInput {
     std::function<void(std::string_view)> Message;
 };
 
+struct MacOsGuestFileRange {
+    std::uint64_t Address;
+    std::uint64_t Offset;
+    std::uint64_t Size;
+};
+
+struct MacOsGuestLayout {
+    std::uint64_t LoadBias;
+    std::vector<MacOsGuestFileRange> GuestLoads;
+    std::vector<MacOsGuestFileRange> FileRanges;
+};
+
 std::uint64_t GuestTlsBlockSize(const Domain::ProgramHeader& tls);
 
 std::vector<std::uint8_t> WriteMacOsImage(MacOsImageInput& input);
+
+std::optional<MacOsGuestLayout> ReadMacOsGuestLayout(const std::vector<std::uint8_t>& file);
 
 std::string MachOLoadPath(const std::string& path, const std::string& origin);
 std::vector<std::string> MachORunPaths(const std::string& paths, const std::string& origin);

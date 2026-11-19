@@ -12,6 +12,7 @@ from test_guest_intel_trampolines import PLAIN_SITE, SITE, elf_loads, guest_fixt
 from test_guest_syscall_trap import GENERIC_STUB
 import test_jmprel_table_bounds
 from test_guest_none_relocations import JUMP_SLOT, RELATIVE, TARGET, module
+from test_macos_output import MachO
 
 
 def patch_site(image):
@@ -173,6 +174,53 @@ def main():
         assert result.returncode == 1 and "mismatch: flip_bit eboot.bin" in result.stdout and "patch is not applied" in result.stdout and "applied: picker/picker.bin" in result.stdout, (result.stdout, result.stderr)
         result = run("--verify-patches", str(work / "plain" / "out" / "app.patches.toml"), str(output), "--verify-output")
         assert result.returncode == 2 and "linux_base" in result.stderr, (result.stdout, result.stderr)
+
+        for name, options in (("macos", []), ("macos-fixed", ["--macos-fixed-base", "0x400000"])):
+            root, source, output = case(name)
+            output = output.with_suffix(".macho")
+            (root / "in" / "picker").mkdir()
+            (root / "in" / "picker" / "picker.bin").write_bytes(image)
+            (root / "in" / "sce_module").mkdir()
+            config = root / "p.toml"
+            config.write_text(patch_text(address, expected, "flip_bit") + patch_text(address, expected, target="picker/picker.bin").split("\n", 1)[1])
+            result = run("--macos", *options, "--executable", "picker/picker.bin", "--patches", str(config), str(source), str(output))
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            manifest = output.with_suffix(".patches.toml")
+            text = manifest.read_text(encoding="utf-8")
+            assert "linux_base" not in text and "output_rva" not in text, text
+            command = ("--verify-patches", str(manifest), str(output), "--verify-output")
+            result = run(*command)
+            assert result.returncode == 0 and "not-checked: picker/picker.bin" in result.stdout, (result.stdout, result.stderr)
+            before = sorted(work.rglob("*"))
+            result = run(*command, "--executable", "picker/picker.bin")
+            assert result.returncode == 0 and "applied: flip_bit eboot.bin" in result.stdout and "applied: picker/picker.bin" in result.stdout, (result.stdout, result.stderr)
+            assert sorted(work.rglob("*")) == before, "verify wrote files"
+            offset = int(re.search(r"applied: flip_bit eboot\.bin va=0x[0-9a-f]+ off=0x([0-9a-f]+) ", result.stdout).group(1), 16)
+            original = output.read_bytes()
+            macho = MachO(original)
+            assert offset == macho.segment("__ELF0")["fileoff"] + address - elf_loads(image)[0][3], result.stdout
+            assert original[offset] == expected ^ 1, (offset, original[offset])
+            padding = root / "padding.toml"
+            padding.write_text(text.replace(f"va = {address:#x}", f"va = {address + 1:#x}", 1), encoding="utf-8")
+            result = run("--verify-patches", str(padding), str(output), "--verify-output")
+            assert result.returncode == 1 and "one guest PT_LOAD" in result.stdout, (result.stdout, result.stderr)
+            result = run("--verify-patches", str(work / "plain" / "out" / "app.patches.toml"), str(output), "--verify-output")
+            assert result.returncode == 2 and "linux_base" in result.stderr, (result.stdout, result.stderr)
+            tampered = bytearray(original)
+            tampered[offset] = expected
+            output.write_bytes(tampered)
+            result = run(*command, "--executable", "picker/picker.bin")
+            assert result.returncode == 1 and "mismatch: flip_bit eboot.bin" in result.stdout and "patch is not applied" in result.stdout and "applied: picker/picker.bin" in result.stdout, (result.stdout, result.stderr)
+
+            _, _, meta_offset = macho.sections[("__APS5DATA", "__meta")]
+            without_version = bytearray(original)
+            struct.pack_into("<Q", without_version, meta_offset, 0)
+            output.write_bytes(without_version)
+            result = run(*command)
+            assert result.returncode == 2 and "guest metadata" in result.stderr, (result.stdout, result.stderr)
+            output.write_bytes(original[:48])
+            result = run(*command)
+            assert result.returncode == 2 and "load commands" in result.stderr, (result.stdout, result.stderr)
 
         relocation_overlap(relinker, work)
         writer_overlap(relinker, work)

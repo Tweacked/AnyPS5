@@ -1,6 +1,7 @@
 #include <relinker/patching/GamePatch.hpp>
 #include <domain/Types.hpp>
 #include <elfpatcher/general/ElfConstants.hpp>
+#include <elfpatcher/macos/MacOsImage.hpp>
 #include <io/BufferUtils.hpp>
 #include <io/NativePath.hpp>
 #include <algorithm>
@@ -345,6 +346,34 @@ std::vector<EntryRange> ResolveEach(const ElfReader& reader, const std::vector<P
     return resolved;
 }
 
+std::vector<EntryRange> ResolveEach(const Elfpatcher::MacOs::MacOsGuestLayout& layout, const std::vector<PatchEntry>& entries) {
+    const auto contains = [](const auto& range, const std::uint64_t address, const std::uint64_t size) {
+        return address >= range.Address && address - range.Address < range.Size && size <= range.Size - (address - range.Address);
+    };
+    std::vector<EntryRange> resolved;
+    resolved.reserve(entries.size());
+    for (const auto& entry : entries) {
+        ValidateWidth(entry);
+        const auto length = entry.Value.size();
+        if (std::none_of(layout.GuestLoads.begin(), layout.GuestLoads.end(), [&](const auto& load) {
+            return contains(load, entry.VirtualAddress, length);
+        })) {
+            resolved.push_back({std::nullopt, "range is not inside the file bytes of one guest PT_LOAD"});
+            continue;
+        }
+        const auto address = entry.VirtualAddress + layout.LoadBias;
+        const auto segment = std::find_if(layout.FileRanges.begin(), layout.FileRanges.end(), [&](const auto& range) {
+            return contains(range, address, length);
+        });
+        if (segment == layout.FileRanges.end()) {
+            resolved.push_back({std::nullopt, "range is not stored in the Mach-O guest segments"});
+            continue;
+        }
+        resolved.push_back({PatchedRange{segment->Offset + (address - segment->Address), length, entry.VirtualAddress}, {}});
+    }
+    return resolved;
+}
+
 bool Overlaps(const std::uint64_t firstOffset, const std::uint64_t firstLength, const std::uint64_t secondOffset, const std::uint64_t secondLength) {
     return firstOffset < secondOffset + secondLength && secondOffset < firstOffset + firstLength;
 }
@@ -681,6 +710,7 @@ std::string_view StatusName(const VerifyStatus status) {
 }
 
 std::vector<VerifyResult> VerifyPatches(const PatchFile& file, const std::vector<VerifyTarget>& executables, const std::vector<VerifyTarget>& modules, const bool outputMode) {
+    std::map<const VerifyTarget*, Elfpatcher::MacOs::MacOsGuestLayout> macosLayouts;
     if (outputMode) {
         if (!file.MainTarget) throw Domain::RelinkerException("The patch file has no main_target, so its entries cannot be matched to an output: verify the input executable, or verify the manifest written by the conversion");
         for (std::size_t index = 0; index < executables.size(); ++index)
@@ -691,8 +721,13 @@ std::vector<VerifyResult> VerifyPatches(const PatchFile& file, const std::vector
                 if (file.LinuxBase) throw Domain::RelinkerException(executable.Name + " is a Windows PE output, but the patch file has linux_base = " + HexValue(*file.LinuxBase) + ": verify the output of the conversion that wrote it");
                 continue;
             }
+            if (auto layout = Elfpatcher::MacOs::ReadMacOsGuestLayout(executable.Bytes)) {
+                if (file.LinuxBase) throw Domain::RelinkerException(executable.Name + " is a macOS Mach-O output, but the patch file has linux_base = " + HexValue(*file.LinuxBase) + ": verify the output of the conversion that wrote it");
+                macosLayouts.emplace(&executable, std::move(*layout));
+                continue;
+            }
             const bool fixed = IsElfOfType(executable.Bytes, Elfpatcher::ET_EXEC);
-            if (!fixed && !IsElfOfType(executable.Bytes, Elfpatcher::ET_DYN)) throw Domain::RelinkerException(executable.Name + " is not a Linux ELF or Windows PE output (Mach-O outputs are not supported): verify the input instead");
+            if (!fixed && !IsElfOfType(executable.Bytes, Elfpatcher::ET_DYN)) throw Domain::RelinkerException(executable.Name + " is not a Linux ELF, Windows PE or macOS Mach-O output: verify the input instead");
             if (fixed && !file.LinuxBase) throw Domain::RelinkerException(executable.Name + " is an ET_EXEC Linux ELF output, but the patch file has no linux_base: verify the manifest written by its conversion");
             if (!fixed && file.LinuxBase) throw Domain::RelinkerException(executable.Name + " is an ET_DYN Linux ELF output, but the patch file has linux_base = " + HexValue(*file.LinuxBase) + ": verify the output of the conversion that wrote it");
         }
@@ -748,8 +783,8 @@ std::vector<VerifyResult> VerifyPatches(const PatchFile& file, const std::vector
             if (own.back().VirtualAddress > std::numeric_limits<std::uint64_t>::max() - base) throw Domain::RelinkerException(Describe(own.back()) + " lies outside the address space at linux_base = " + HexValue(base));
             own.back().VirtualAddress += base;
         }
-        const ElfReader reader(target->Bytes);
-        const auto resolved = ResolveEach(reader, own);
+        const auto macos = macosLayouts.find(target);
+        const auto resolved = macos == macosLayouts.end() ? ResolveEach(ElfReader(target->Bytes), own) : ResolveEach(macos->second, own);
         RejectEntryOverlaps(own, resolved);
         for (std::size_t position = 0; position < indices.size(); ++position) {
             results[indices[position]] = VerifyOne(own[position], resolved[position], target->Bytes, outputMode);
