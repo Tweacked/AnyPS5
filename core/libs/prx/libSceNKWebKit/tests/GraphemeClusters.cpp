@@ -3,10 +3,13 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <sstream>
 #include <source_location>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace {
 
@@ -94,18 +97,51 @@ void Run() {
 
     const std::u16string combining = u"é";
     const StringView combiningView {combining.data(), static_cast<unsigned>(combining.size()), false};
-    Require(Throws([&] { Clusters(combiningView); }, "not implemented"));
-    Require(Throws([&] { CodeUnits(combiningView, 1); }, "not implemented"));
+    Require(Clusters(combiningView) == 1);
+    Require(CodeUnits(combiningView, 1) == 2);
     Require(CodeUnits(combiningView, 2) == 2);
 
     const std::u16string surrogate = u"a\U0001F600";
     const StringView surrogateView {surrogate.data(), static_cast<unsigned>(surrogate.size()), false};
-    Require(Throws([&] { Clusters(surrogateView); }, "not implemented"));
+    Require(Clusters(surrogateView) == 2);
+    Require(CodeUnits(surrogateView, 1) == 1);
+    Require(CodeUnits(surrogateView, 2) == 3);
+}
+
+void RunUnicodeCases(const char* path) {
+    std::ifstream input(path);
+    Require(bool(input));
+    unsigned cases = 0;
+    for (std::string line; std::getline(input, line);) {
+        std::istringstream tokens(line.substr(0, line.find('#')));
+        std::u16string text;
+        std::vector<unsigned> boundaries;
+        for (std::string token; tokens >> token;) {
+            if (token == "\xc3\xb7") boundaries.push_back(static_cast<unsigned>(text.size()));
+            else if (token != "\xc3\x97") {
+                const auto scalar = std::stoul(token, nullptr, 16);
+                Require(scalar <= 0x10ffff);
+                if (scalar <= 0xffff) text.push_back(static_cast<char16_t>(scalar));
+                else {
+                    text.push_back(static_cast<char16_t>(0xd800 + ((scalar - 0x10000) >> 10)));
+                    text.push_back(static_cast<char16_t>(0xdc00 + ((scalar - 0x10000) & 0x3ff)));
+                }
+            }
+        }
+        if (boundaries.empty()) continue;
+        const StringView view {text.data(), static_cast<unsigned>(text.size()), false};
+        Require(Clusters(view) == boundaries.size() - 1);
+        for (unsigned i = 0; i < boundaries.size(); ++i) Require(CodeUnits(view, i) == boundaries[i]);
+        ++cases;
+    }
+    Require(cases != 0);
+    std::printf("Verified grapheme counts and UTF-16 offsets against %u Unicode cases\n", cases);
 }
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     Run();
+    if (argc == 2) RunUnicodeCases(argv[1]);
     return 0;
 }
